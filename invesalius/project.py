@@ -24,6 +24,7 @@ import shutil
 import sys
 import tarfile
 import tempfile
+from contextlib import contextmanager
 from typing import TYPE_CHECKING, Dict, List, Union
 
 import numpy as np
@@ -49,6 +50,32 @@ if sys.platform == "win32":
         _has_win32api = False
 else:
     _has_win32api = False
+
+
+@contextmanager
+def temp_file_and_dir_context():
+    """Context manager to handle temporary files and directories cleanup"""
+    temp_files = []
+    temp_dirs = []
+
+    try:
+        yield temp_files, temp_dirs
+    finally:
+        # Clean up temp files
+        for tf in temp_files:
+            try:
+                if os.path.exists(tf):
+                    os.unlink(tf)
+            except Exception as e:
+                debug(f"Failed to remove temp file {tf}: {e}")
+
+        # Clean up temp directories
+        for td in temp_dirs:
+            try:
+                if os.path.exists(td):
+                    shutil.rmtree(td)
+            except Exception as e:
+                debug(f"Failed to remove temp directory {td}: {e}")
 
 
 # Only one project will be initialized per time. Therefore, we use
@@ -203,83 +230,75 @@ class Project(metaclass=Singleton):
         return measures
 
     def SavePlistProject(self, dir_, filename, compress=False):
-        dir_temp = decode(tempfile.mkdtemp(), const.FS_ENCODE)
+        with temp_file_and_dir_context() as (temp_files, temp_dirs):
+            dir_temp = decode(tempfile.mkdtemp(), const.FS_ENCODE)
+            # CHANGE: Track temporary directory for cleanup
+            temp_dirs.append(dir_temp)
 
-        self.compress = compress
+            self.compress = compress
+            filelist = {}
 
-        # filename_tmp = os.path.join(dir_temp, "matrix.dat")
-        filelist = {}
+            project = {
+                "format_version": const.INVESALIUS_ACTUAL_FORMAT_VERSION,
+                "invesalius_version": const.INVESALIUS_VERSION,
+                "date": datetime.datetime.now().isoformat(),
+                "compress": self.compress,
+                "name": self.name,
+                "modality": self.modality,
+                "orientation": self.original_orientation,
+                "window_width": self.window,
+                "window_level": self.level,
+                "scalar_range": self.threshold_range,
+                "spacing": self.spacing,
+                "affine": self.affine,
+                "image_fiducials": self.image_fiducials.tolist(),
+            }
 
-        project = {
-            # Format info
-            "format_version": const.INVESALIUS_ACTUAL_FORMAT_VERSION,
-            "invesalius_version": const.INVESALIUS_VERSION,
-            "date": datetime.datetime.now().isoformat(),
-            "compress": self.compress,
-            # case info
-            "name": self.name,  # patient's name
-            "modality": self.modality,  # CT, RMI, ...
-            "orientation": self.original_orientation,
-            "window_width": self.window,
-            "window_level": self.level,
-            "scalar_range": self.threshold_range,
-            "spacing": self.spacing,
-            "affine": self.affine,
-            "image_fiducials": self.image_fiducials.tolist(),
-        }
+            matrix = {
+                "filename": "matrix.dat",
+                "shape": self.matrix_shape,
+                "dtype": self.matrix_dtype,
+            }
+            project["matrix"] = matrix
+            filelist[self.matrix_filename] = "matrix.dat"
 
-        # Saving the matrix containing the slices
-        matrix = {
-            "filename": "matrix.dat",
-            "shape": self.matrix_shape,
-            "dtype": self.matrix_dtype,
-        }
-        project["matrix"] = matrix
-        filelist[self.matrix_filename] = "matrix.dat"
-        # shutil.copyfile(self.matrix_filename, filename_tmp)
+            # Save masks
+            masks = {}
+            for index in self.mask_dict:
+                masks[str(index)] = self.mask_dict[index].SavePlist(dir_temp, filelist)
+            project["masks"] = masks
 
-        # Saving the masks
-        masks = {}
-        for index in self.mask_dict:
-            masks[str(index)] = self.mask_dict[index].SavePlist(dir_temp, filelist)
-        project["masks"] = masks
+            # Save surfaces
+            surfaces = {}
+            for index in self.surface_dict:
+                surfaces[str(index)] = self.surface_dict[index].SavePlist(dir_temp, filelist)
+            project["surfaces"] = surfaces
 
-        # Saving the surfaces
-        surfaces = {}
-        for index in self.surface_dict:
-            surfaces[str(index)] = self.surface_dict[index].SavePlist(dir_temp, filelist)
-        project["surfaces"] = surfaces
+            # Save measurements
+            measurements = self.GetMeasuresDict()
+            measurements_filename = "measurements.plist"
+            fd_mplist, temp_mplist = tempfile.mkstemp()
+            # CHANGE: Track temporary file for cleanup
+            temp_files.append(temp_mplist)
+            with open(temp_mplist, "w+b") as f:
+                plistlib.dump(measurements, f)
+            filelist[temp_mplist] = measurements_filename
+            project["measurements"] = measurements_filename
+            os.close(fd_mplist)
 
-        # Saving the measurements
-        measurements = self.GetMeasuresDict()
-        measurements_filename = "measurements.plist"
-        fd_mplist, temp_mplist = tempfile.mkstemp()
-        with open(temp_mplist, "w+b") as f:
-            plistlib.dump(measurements, f)
-        filelist[temp_mplist] = measurements_filename
-        project["measurements"] = measurements_filename
-        os.close(fd_mplist)
+            project["annotations"] = {}
 
-        # Saving the annotations (empty in this version)
-        project["annotations"] = {}
+            # Save main plist
+            temp_fd, temp_plist = tempfile.mkstemp()
+            # CHANGE: Track temporary file for cleanup
+            temp_files.append(temp_plist)
+            with open(temp_plist, "w+b") as f:
+                plistlib.dump(project, f)
+            filelist[temp_plist] = "main.plist"
+            os.close(temp_fd)
 
-        # Saving the main plist
-        temp_fd, temp_plist = tempfile.mkstemp()
-        with open(temp_plist, "w+b") as f:
-            plistlib.dump(project, f)
-        filelist[temp_plist] = "main.plist"
-        os.close(temp_fd)
-
-        # Compressing and generating the .inv3 file
-        path = os.path.join(dir_, filename)
-        Compress(dir_temp, path, filelist, compress)
-
-        # Removing the temp folder.
-        shutil.rmtree(dir_temp)
-
-        for f in filelist:
-            if filelist[f].endswith(".plist"):
-                os.remove(f)
+            path = os.path.join(dir_, filename)
+            Compress(dir_temp, path, filelist, compress)
 
     def OpenPlistProject(self, filename):
         if not const.VTK_WARNING:
@@ -487,25 +506,38 @@ def Compress(
     filelist: Dict[Union[str, os.PathLike], Union[str, os.PathLike]],
     compress: bool = False,
 ) -> None:
-    tmpdir, tmpdir_ = os.path.split(folder)
-    # current_dir = os.path.abspath(".")
-    fd_inv3, temp_inv3 = tempfile.mkstemp()
-    if _has_win32api:
-        temp_inv3 = win32api.GetShortPathName(temp_inv3)
+    # CHANGE: Added context manager for temp file handling
+    with temp_file_and_dir_context() as (temp_files, temp_dirs):
+        tmpdir, tmpdir_ = os.path.split(folder)
+        fd_inv3, temp_inv3 = tempfile.mkstemp()
+        # CHANGE: Track temporary file for cleanup
+        temp_files.append(temp_inv3)
 
-    temp_inv3 = decode(temp_inv3, const.FS_ENCODE)
-    # os.chdir(tmpdir)
-    # file_list = glob.glob(os.path.join(tmpdir_,"*"))
-    if compress:
-        tar = tarfile.open(temp_inv3, "w:gz")
-    else:
-        tar = tarfile.open(temp_inv3, "w")
-    for name in filelist:
-        tar.add(name, arcname=os.path.join(tmpdir_, filelist[name]))
-    tar.close()
-    os.close(fd_inv3)
-    shutil.move(temp_inv3, filename)
-    # os.chdir(current_dir)
+        if _has_win32api:
+            temp_inv3 = win32api.GetShortPathName(temp_inv3)
+
+        temp_inv3 = decode(temp_inv3, const.FS_ENCODE)
+
+        # CHANGE: Added try/finally block to ensure proper cleanup
+        try:
+            if compress:
+                tar = tarfile.open(temp_inv3, "w:gz")
+            else:
+                tar = tarfile.open(temp_inv3, "w")
+
+            for name in filelist:
+                sanit_name = os.path.normpath(filelist[name])
+                if ".." in sanit_name or os.path.isabs(sanit_name):
+                    continue
+                tar.add(name, arcname=os.path.join(tmpdir_, filelist[name]))
+
+            tar.close()
+            os.close(fd_inv3)
+            shutil.move(temp_inv3, filename)
+        except Exception:
+            # CHANGE: Added explicit cleanup in case of error
+            os.close(fd_inv3)
+            raise
 
 
 def Extract(filename: Union[str, bytes, os.PathLike], folder: Union[str, bytes, os.PathLike]):
